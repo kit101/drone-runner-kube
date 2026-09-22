@@ -201,7 +201,7 @@ func (p *proxy) serve(plane string, w http.ResponseWriter, r *http.Request) {
 			if plane == "kube" {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(matched.Status)
-				_ = json.NewEncoder(w).Encode(map[string]any{
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
 					"apiVersion": "v1", "kind": "Status", "status": "Failure",
 					"message": "fault injected", "reason": statusReason(matched.Status), "code": matched.Status,
 				})
@@ -399,7 +399,7 @@ func (p *proxy) addEvent(item event) {
 	p.events = append(p.events, item)
 }
 
-func writeJSON(w http.ResponseWriter, value any) {
+func writeJSON(w http.ResponseWriter, value interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(value); err != nil {
 		log.Printf("control response encode failed: %v", err)

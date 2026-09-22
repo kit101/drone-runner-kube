@@ -40,16 +40,29 @@ func cleanupClient() *cleanupFake {
 }
 
 func TestDestroyAfterSetupFailure(t *testing.T) {
-	for _, resource := range []string{"secrets", "pods"} {
-		t.Run(resource, func(t *testing.T) {
+	for _, test := range []struct {
+		name, resource string
+	}{
+		{"namespace", "namespaces"},
+		{"pull-secret", "secrets"},
+		{"task-secret", "secrets"},
+		{"pod", "pods"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			c := cleanupClient()
-			c.PrependReactor("create", resource, func(ktesting.Action) (bool, runtime.Object, error) {
-				return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: resource}, "task", errors.New("injected rejection"))
+			c.PrependReactor("create", test.resource, func(ktesting.Action) (bool, runtime.Object, error) {
+				return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: test.resource}, "task", errors.New("injected rejection"))
 			})
 			k := New(c, time.Second, 0)
 			s := &Spec{PodSpec: PodSpec{Name: "task", Namespace: "test"}}
-			if err := k.Setup(context.Background(), s); err == nil {
-				t.Fatal("expected Setup rejection")
+			switch test.name {
+			case "namespace":
+				s.Namespace = "test"
+			case "pull-secret":
+				s.PullSecret = &Secret{Name: "task-pull", Data: "{}"}
+			}
+			if err := k.Setup(context.Background(), s); !apierrors.IsForbidden(err) {
+				t.Fatalf("expected Setup rejection, got %v", err)
 			}
 			for i := 0; i < 2; i++ {
 				if err := k.Destroy(context.Background(), s); err != nil {
@@ -60,6 +73,86 @@ func TestDestroyAfterSetupFailure(t *testing.T) {
 				t.Fatal("partial Setup left a secret")
 			}
 		})
+	}
+}
+
+func TestConcurrentDestroyAcrossSetupStates(t *testing.T) {
+	for _, setup := range []string{"not-started", "failed", "succeeded"} {
+		t.Run(setup, func(t *testing.T) {
+			c := cleanupClient()
+			if setup == "failed" {
+				c.PrependReactor("create", "secrets", func(ktesting.Action) (bool, runtime.Object, error) {
+					return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "secrets"}, "task", errors.New("injected rejection"))
+				})
+			}
+			k := New(c, time.Second, 0)
+			s := &Spec{PodSpec: PodSpec{Name: "task", Namespace: "test"}}
+			if setup != "not-started" {
+				err := k.Setup(context.Background(), s)
+				if (setup == "failed" && !apierrors.IsForbidden(err)) || (setup == "succeeded" && err != nil) {
+					t.Fatalf("unexpected Setup result: %v", err)
+				}
+			}
+			start, results := make(chan struct{}), make(chan error, 8)
+			for i := 0; i < cap(results); i++ {
+				go func() {
+					<-start
+					results <- k.Destroy(context.Background(), s)
+				}()
+			}
+			close(start)
+			for i := 0; i < cap(results); i++ {
+				select {
+				case err := <-results:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("concurrent Destroy did not return")
+				}
+			}
+			select {
+			case <-s.lifecycle().stop:
+			default:
+				t.Fatal("Destroy did not close the stop signal")
+			}
+		})
+	}
+}
+
+func TestDestroyAfterCreateConnectionLossAndDeleteTimeout(t *testing.T) {
+	c := cleanupClient()
+	connectionLost := errors.New("http2: client connection lost")
+	var creates, deletes int32
+	c.PrependReactor("create", "secrets", func(a ktesting.Action) (bool, runtime.Object, error) {
+		atomic.AddInt32(&creates, 1)
+		obj := a.(ktesting.CreateAction).GetObject()
+		obj.(metav1.Object).SetUID("created-before-connection-loss")
+		// The API committed the Secret, but its response was lost.
+		if err := c.Tracker().Create(a.GetResource(), obj, a.GetNamespace()); err != nil {
+			return true, nil, err
+		}
+		return true, nil, connectionLost
+	})
+	c.PrependReactor("delete", "secrets", func(ktesting.Action) (bool, runtime.Object, error) {
+		if atomic.AddInt32(&deletes, 1) == 1 {
+			return true, nil, errors.New("net/http: TLS handshake timeout")
+		}
+		return false, nil, nil
+	})
+	k := New(c, time.Second, 0)
+	s := &Spec{PodSpec: PodSpec{Name: "task", Namespace: "test"}}
+	if err := k.Setup(context.Background(), s); err != connectionLost {
+		t.Fatalf("Setup lost the original create error: %v", err)
+	}
+	if err := k.Destroy(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	if atomic.LoadInt32(&creates) != 1 || atomic.LoadInt32(&deletes) != 2 {
+		t.Fatalf("unexpected request counts: create=%d delete=%d", creates, deletes)
+	}
+	if _, err := c.CoreV1().Secrets("test").Get(context.Background(), "task", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("Secret was not removed after delete recovery: %v", err)
 	}
 }
 

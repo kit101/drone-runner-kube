@@ -2,7 +2,10 @@ package engine
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -12,6 +15,8 @@ import (
 	"github.com/drone/runner-go/pipeline/runtime"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kuberuntime "k8s.io/apimachinery/pkg/runtime"
+	ktesting "k8s.io/client-go/testing"
 )
 
 type executionEngineStub struct {
@@ -274,6 +279,139 @@ func TestSharedStepLimitAndCancellationIsolation(t *testing.T) {
 	case <-firstCleaned:
 		t.Fatal("canceling the second task cleaned the first")
 	default:
+	}
+}
+
+func TestSetupFailuresDoNotInterruptOtherTasks(t *testing.T) {
+	const failures = 20
+	client := cleanupClient()
+	rejected := make(map[string]string, failures)
+	for i := 0; i < failures; i++ {
+		resource := "secrets"
+		if i%2 == 1 {
+			resource = "pods"
+		}
+		rejected[fmt.Sprintf("failed-%02d", i)] = resource
+	}
+	client.PrependReactor("create", "*", func(a ktesting.Action) (bool, kuberuntime.Object, error) {
+		name := a.(ktesting.CreateAction).GetObject().(metav1.Object).GetName()
+		if rejected[name] == a.GetResource().Resource {
+			return true, nil, apierrors.NewForbidden(a.GetResource().GroupResource(), name, errors.New("injected setup rejection"))
+		}
+		return false, nil, nil
+	})
+	kube := New(client, time.Second, 0)
+	started, release, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		awaitExecution(t, returned, "concurrent task did not return")
+	}()
+	var runs int32
+	// Exercise the real Kubernetes Setup/Destroy and shared runner-go executor;
+	// only container execution is replaced with a deterministic step barrier.
+	engine := executionEngineStub{
+		setup: kube.Setup, destroy: kube.Destroy,
+		run: func(ctx context.Context, spec runtime.Spec, _ runtime.Step, _ io.Writer) (*runtime.State, error) {
+			name := spec.(*Spec).PodSpec.Name
+			if _, failed := rejected[name]; failed {
+				t.Errorf("task %s executed a step after Setup failed", name)
+			}
+			atomic.AddInt32(&runs, 1)
+			if name == "concurrent" {
+				close(started)
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			return &runtime.State{Exited: true}, nil
+		},
+	}
+	type stageReport struct{ name, status, err string }
+	reports := make(chan stageReport, failures+2)
+	reporter := executionReporterStub{stage: func(_ context.Context, state *pipeline.State) error {
+		state.Lock()
+		defer state.Unlock()
+		reports <- stageReport{state.Stage.Name, state.Stage.Status, state.Stage.Error}
+		return nil
+	}}
+	exec := NewExecer(reporter, pipeline.NopStreamer(), pipeline.NopUploader(), engine, 1)
+	newTask := func(name string) (*Spec, *pipeline.State) {
+		spec := &Spec{PodSpec: PodSpec{Name: name, Namespace: "test"}, Steps: []*Step{{Name: "step", RunPolicy: runtime.RunOnSuccess}}}
+		state := executionState(spec)
+		state.Stage.Name = name
+		return spec, state
+	}
+	concurrent, concurrentState := newTask("concurrent")
+	var concurrentErr error
+	go func() {
+		defer close(returned)
+		concurrentErr = exec.Exec(ctx, concurrent, concurrentState)
+	}()
+	awaitExecution(t, started, "concurrent task did not start")
+	pod, err := client.CoreV1().Pods("test").Get(ctx, concurrent.PodSpec.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < failures; i++ {
+		failed, state := newTask(fmt.Sprintf("failed-%02d", i))
+		if err := exec.Exec(ctx, failed, state); err != nil {
+			t.Fatalf("failed task could not finish reporting: %v", err)
+		}
+		select {
+		case report := <-reports:
+			if report.name != failed.PodSpec.Name || report.status != drone.StatusError || !strings.Contains(report.err, "injected setup rejection") {
+				t.Fatalf("initialization failure was not reported: %+v", report)
+			}
+		default:
+			t.Fatal("missing failure report")
+		}
+		select {
+		case <-concurrent.lifecycle().stop:
+			t.Fatal("failed task stopped the concurrent task")
+		case <-returned:
+			t.Fatal("concurrent task returned before its step was released")
+		default:
+		}
+		current, err := client.CoreV1().Pods("test").Get(ctx, pod.Name, metav1.GetOptions{})
+		if err != nil || current.UID != pod.UID || current.DeletionTimestamp != nil {
+			t.Fatalf("failed task affected the concurrent Pod: %v", err)
+		}
+	}
+	close(release)
+	awaitExecution(t, returned, "concurrent task did not finish after failures")
+	if concurrentErr != nil || concurrentState.Stage.Status != drone.StatusPassing {
+		t.Fatalf("concurrent task failed: status=%s error=%v", concurrentState.Stage.Status, concurrentErr)
+	}
+	next, nextState := newTask("next")
+	if err := exec.Exec(ctx, next, nextState); err != nil || nextState.Stage.Status != drone.StatusPassing {
+		t.Fatalf("executor could not run the next task: status=%s error=%v", nextState.Stage.Status, err)
+	}
+	for _, name := range []string{"concurrent", "next"} {
+		select {
+		case report := <-reports:
+			if report.name != name || report.status != drone.StatusPassing {
+				t.Fatalf("missing successful task report for %s: %+v", name, report)
+			}
+		default:
+			t.Fatalf("missing successful task report for %s", name)
+		}
+	}
+	if atomic.LoadInt32(&runs) != 2 {
+		t.Fatalf("expected only the concurrent and next steps to run, got %d", runs)
+	}
+	if pods, err := client.CoreV1().Pods("test").List(ctx, metav1.ListOptions{}); err != nil || len(pods.Items) != 0 {
+		t.Fatalf("task Pods were not cleaned: %v", err)
+	}
+	if secrets, err := client.CoreV1().Secrets("test").List(ctx, metav1.ListOptions{}); err != nil || len(secrets.Items) != 0 {
+		t.Fatalf("task Secrets were not cleaned: %v", err)
 	}
 }
 
