@@ -68,7 +68,11 @@ func (w *KubernetesWatcher) Watch(ctx context.Context, containers chan<- []conta
 			return true, nil // stop listening to further events
 		}
 
-		containers <- extractContainers(pod)
+		select {
+		case containers <- extractContainers(pod):
+		case <-ctx.Done():
+			return true, ctx.Err()
+		}
 
 		return false, nil
 	})
@@ -117,7 +121,13 @@ func (w *KubernetesWatcher) PeriodicCheck(ctx context.Context, containers chan<-
 				WithField("namespace", w.PodNamespace).
 				Trace("PodWatcher: Periodic container state check")
 
-			containers <- extractContainers(pod)
+			select {
+			case containers <- extractContainers(pod):
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-stop:
+				return nil
+			}
 		}
 	}
 }

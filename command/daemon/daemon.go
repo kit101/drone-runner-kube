@@ -6,6 +6,8 @@ package daemon
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"time"
 
 	"github.com/drone-runners/drone-runner-kube/engine"
@@ -15,6 +17,7 @@ import (
 	"github.com/drone-runners/drone-runner-kube/internal/kube"
 	"github.com/drone-runners/drone-runner-kube/internal/match"
 
+	"github.com/drone/drone-go/drone"
 	"github.com/drone/runner-go/client"
 	"github.com/drone/runner-go/environ/provider"
 	"github.com/drone/runner-go/handler/router"
@@ -108,6 +111,18 @@ func (c *daemonCommand) run(*kingpin.ParseContext) error {
 
 	kubeEngine := engine.New(kubeClient,
 		time.Duration(config.Engine.ContainerStartTimeout)*time.Second, time.Duration(config.Engine.ContainerTimeToWaitForLogs)*time.Second)
+	if config.Recovery.Enabled {
+		if config.Runner.Config != "" || os.Getpid() != 1 {
+			return fmt.Errorf("cleanup recovery requires an in-cluster runner running as container PID 1")
+		}
+		if err := engine.EnableRecovery(ctx, kubeEngine, engine.RecoveryConfig{
+			Namespace: config.Recovery.Namespace, Pool: config.Recovery.Pool,
+			PodNamespace: config.Recovery.PodNamespace, PodName: config.Recovery.PodName,
+			PodUID: config.Recovery.PodUID, ContainerName: config.Recovery.ContainerName,
+		}); err != nil {
+			return fmt.Errorf("initialize cleanup recovery: %w", err)
+		}
+	}
 
 	remote := remote.New(cli)
 	tracer := history.New(remote)
@@ -190,7 +205,7 @@ func (c *daemonCommand) run(*kingpin.ParseContext) error {
 				ED25519: config.Tmate.ED25519,
 			},
 		},
-		Exec: runtime.NewExecer(
+		Exec: engine.NewExecer(
 			tracer,
 			remote,
 			upload,
@@ -203,8 +218,12 @@ func (c *daemonCommand) run(*kingpin.ParseContext) error {
 		// NOTE the single flight wrapper limits the number
 		// of open requests when polling the queue. This is
 		// an experimental feature and requires further testing.
-		Client:   &client.SingleFlight{Client: cli},
-		Dispatch: runner.Run,
+		Client: &client.SingleFlight{Client: cli},
+		// The upstream poller dispatches with a background context. Bind tasks
+		// to daemon shutdown while retaining the poller's logging fields.
+		Dispatch: func(taskCtx context.Context, stage *drone.Stage) error {
+			return runner.Run(logger.WithContext(ctx, logger.FromContext(taskCtx)), stage)
+		},
 		Filter: &client.Filter{
 			Kind:   resource.Kind,
 			Type:   resource.Type,

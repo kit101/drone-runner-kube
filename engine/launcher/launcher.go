@@ -24,6 +24,7 @@ const aggregateTimer = 400 * time.Millisecond
 // Than the containers are updates with a single call to Kubernetes API.
 type Launcher struct {
 	stop, stopped chan struct{}
+	stopOnce      sync.Once
 
 	kubeClient  kubernetes.Interface
 	podUpdateMx *sync.Mutex
@@ -63,8 +64,7 @@ func New(podName, podNamespace string, clientset kubernetes.Interface, podUpdate
 
 // Stop terminates Launcher's main go routine.
 func (l *Launcher) Stop() {
-	close(l.stop)
-	<-l.stopped
+	l.stopOnce.Do(func() { close(l.stop) })
 }
 
 // Start starts Launcher's main go routine.
@@ -80,6 +80,12 @@ func (l *Launcher) Start(ctx context.Context) {
 
 	go func() {
 		defer close(l.stopped)
+		defer t.Stop()
+		defer func() {
+			for _, req := range l.requests {
+				req.chErr <- context.Canceled
+			}
+		}()
 
 		for {
 			select {
@@ -113,14 +119,22 @@ func (l *Launcher) Start(ctx context.Context) {
 }
 
 // Launch schedules launch of a pod's container.
-func (l *Launcher) Launch(containerID, containerImage string, statusEnvs map[string]string) <-chan error {
-	chErr := make(chan error)
-	l.requestCh <- request{
+func (l *Launcher) Launch(ctx context.Context, containerID, containerImage string, statusEnvs map[string]string) <-chan error {
+	chErr := make(chan error, 1)
+	select {
+	case <-ctx.Done():
+		chErr <- ctx.Err()
+	case <-l.stop:
+		chErr <- context.Canceled
+	case <-l.stopped:
+		chErr <- context.Canceled
+	case l.requestCh <- request{
 		containerID:    containerID,
 		containerImage: containerImage,
 		chErr:          chErr,
 		statusEnvs:     statusEnvs,
 		found:          false,
+	}:
 	}
 
 	return chErr

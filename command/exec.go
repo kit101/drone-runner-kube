@@ -272,14 +272,14 @@ func (c *execCommand) run(*kingpin.ParseContext) error {
 		return err
 	}
 
-	engine := engine.New(kubeClient,
+	kubeEngine := engine.New(kubeClient,
 		time.Duration(c.Engine.ContainerStartTimeout)*time.Second, time.Duration(0)*time.Second)
 
-	err = runtime.NewExecer(
+	err = engine.NewExecer(
 		pipeline.NopReporter(),
 		console.New(c.Pretty),
 		pipeline.NopUploader(),
-		engine,
+		kubeEngine,
 		c.Procs,
 	).Exec(ctx, spec, state)
 

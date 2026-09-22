@@ -154,6 +154,16 @@ type Config struct {
 		QPS   float32 `envconfig:"DRONE_KUBE_CLIENT_QPS"`
 		Burst int     `envconfig:"DRONE_KUBE_CLIENT_BURST"`
 	}
+
+	Recovery struct {
+		Enabled       bool   `envconfig:"DRONE_CLEANUP_RECOVERY_ENABLED" default:"false"`
+		Namespace     string `envconfig:"DRONE_CLEANUP_NAMESPACE"`
+		Pool          string `envconfig:"DRONE_CLEANUP_POOL"`
+		PodNamespace  string `envconfig:"DRONE_RUNNER_POD_NAMESPACE"`
+		PodName       string `envconfig:"DRONE_RUNNER_POD_NAME"`
+		PodUID        string `envconfig:"DRONE_RUNNER_POD_UID"`
+		ContainerName string `envconfig:"DRONE_RUNNER_CONTAINER_NAME"`
+	}
 }
 
 // legacy environment variables. the key is the legacy

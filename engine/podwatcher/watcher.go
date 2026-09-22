@@ -65,7 +65,7 @@ func (pw *PodWatcher) Start(ctx context.Context, cw ContainerWatcher) {
 	pw.containerRegCh = make(chan containerRegInfo)
 	pw.clientCh = make(chan *waitClient) // a channel for accepting new wait clients
 
-	errDone := make(chan error)
+	errDone := make(chan error, 1)
 
 	wg := &sync.WaitGroup{}
 	wg.Add(3)

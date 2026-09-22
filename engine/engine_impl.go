@@ -7,6 +7,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -18,7 +19,6 @@ import (
 	"github.com/drone/runner-go/pipeline/runtime"
 
 	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 )
@@ -28,6 +28,7 @@ type Kubernetes struct {
 	client    kubernetes.Interface
 	watchers  *sync.Map
 	launchers *sync.Map
+	recovery  *recovery
 
 	containerStartTimeout      time.Duration
 	containerTimeToWaitForLogs time.Duration // HACK: this timeout delays fetching the logs to ensure there is enough time to stream the logs.
@@ -54,113 +55,77 @@ func New(client kubernetes.Interface, containerStartTimeout, containerTimeToWait
 // Setup the pipeline environment.
 func (k *Kubernetes) Setup(ctx context.Context, specv runtime.Spec) (err error) {
 	spec := specv.(*Spec)
+	c := spec.lifecycle()
+	c.mu.Lock()
+	c.setupDone = false
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.setupDone = true
+		c.mu.Unlock()
+		if err != nil {
+			k.stopCleanup(spec)
+		}
+	}()
 
-	log := logger.FromContext(ctx).
-		WithField("pod", spec.PodSpec.Name).
-		WithField("namespace", spec.PodSpec.Namespace)
-
+	// Setup can be canceled even when Destroy is called concurrently.
+	setupCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-c.stop:
+			cancel()
+		case <-setupCtx.Done():
+		}
+	}()
+	if k.recovery != nil {
+		if spec.Namespace == k.recovery.config.Namespace || spec.PodSpec.Namespace == k.recovery.config.Namespace {
+			return fmt.Errorf("task resources cannot use the recovery management namespace")
+		}
+		if err = setupCtx.Err(); err != nil {
+			return err
+		}
+		if err = k.recovery.checkTask(setupCtx, spec); err != nil {
+			return err
+		}
+		if err = k.recovery.initialize(c); err != nil {
+			return fmt.Errorf("initialize cleanup record: %w", err)
+		}
+	}
 	if spec.Namespace != "" {
-		namespace := toNamespace(spec.Namespace, spec.PodSpec.Labels)
-		_, err = k.client.CoreV1().Namespaces().Create(ctx, namespace, metav1.CreateOptions{})
-		if err != nil {
-			log.WithError(err).Error("failed to create namespace")
+		if err = k.create(setupCtx, spec, "namespaces", toNamespace(spec.Namespace, spec.PodSpec.Labels)); err != nil {
 			return err
 		}
-		log.Trace("created namespace")
 	}
-
 	if spec.PullSecret != nil {
-		pullSecret := toDockerConfigSecret(spec)
-		_, err = k.client.CoreV1().Secrets(spec.PodSpec.Namespace).Create(ctx, pullSecret, metav1.CreateOptions{})
-		if err != nil {
-			log.WithError(err).Error("failed to create pull secret")
+		if err = k.create(setupCtx, spec, "secrets", toDockerConfigSecret(spec)); err != nil {
 			return err
 		}
-		log.Trace("created pull secret")
 	}
-
-	secret := toSecret(spec)
-	_, err = k.client.CoreV1().Secrets(spec.PodSpec.Namespace).Create(ctx, secret, metav1.CreateOptions{})
-	if err != nil {
-		log.WithError(err).Error("failed to create secret")
+	if err = k.create(setupCtx, spec, "secrets", toSecret(spec)); err != nil {
 		return err
 	}
-	log.Trace("created secret")
-
-	_, err = k.client.CoreV1().Pods(spec.PodSpec.Namespace).Create(ctx, toPod(spec), metav1.CreateOptions{})
-	if err != nil {
-		log.WithError(err).Error("failed to create pod")
-		return err
-	}
-	log.Trace("created pod")
-
-	spec.stop = make(chan struct{})
-
-	return nil
+	return k.create(setupCtx, spec, "pods", toPod(spec))
 }
 
-// Destroy the pipeline environment.
+// Destroy stops execution and waits for confirmed removal. Persistent failures
+// remain queued in memory and are retried while this runner is alive.
 func (k *Kubernetes) Destroy(ctx context.Context, specv runtime.Spec) error {
-	// HACK: this timeout delays deleting the Pod to ensure
-	// there is enough time to stream the logs.
-	time.Sleep(time.Second * 5)
-
 	spec := specv.(*Spec)
-
-	log := logger.FromContext(ctx).
-		WithField("pod", spec.PodSpec.Name).
-		WithField("namespace", spec.PodSpec.Namespace)
-
-	if spec.PullSecret != nil {
-		if err := k.client.CoreV1().Secrets(spec.PodSpec.Namespace).Delete(context.Background(), spec.PullSecret.Name, metav1.DeleteOptions{}); err != nil {
-			log.WithError(err).Error("failed to delete pull secret")
-		} else {
-			log.Trace("deleted pull secret")
-		}
+	c := k.stopCleanup(spec)
+	key := spec.PodSpec.Namespace + "/" + spec.PodSpec.Name
+	k.launchers.Delete(key)
+	k.watchers.Delete(key)
+	timer := time.NewTimer(cleanupTimeout)
+	defer timer.Stop()
+	select {
+	case <-c.done:
+		return nil
+	case <-timer.C:
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return fmt.Errorf("cleanup pending for %s (task %s): %v", key, c.id, c.err)
 	}
-
-	if err := k.client.CoreV1().Secrets(spec.PodSpec.Namespace).Delete(context.Background(), spec.PodSpec.Name, metav1.DeleteOptions{}); err != nil {
-		log.WithError(err).Error("failed to delete secret")
-	} else {
-		log.Trace("deleted secret")
-	}
-
-	close(spec.stop)
-
-	var isPodDeleted bool
-
-	if err := k.client.CoreV1().Pods(spec.PodSpec.Namespace).Delete(context.Background(), spec.PodSpec.Name, metav1.DeleteOptions{}); err != nil {
-		log.WithError(err).Error("failed to delete pod")
-	} else {
-		log.Trace("deleted pod")
-		isPodDeleted = true
-	}
-
-	if spec.Namespace != "" {
-		if err := k.client.CoreV1().Namespaces().Delete(context.Background(), spec.Namespace, metav1.DeleteOptions{}); err != nil {
-			log.WithError(err).Error("failed to delete namespace")
-		} else {
-			log.Trace("deleted namespace")
-		}
-	}
-
-	if _l, loaded := k.launchers.LoadAndDelete(spec.PodSpec.Name); loaded {
-		l := _l.(*launcher.Launcher)
-		l.Stop()
-	}
-
-	if w, loaded := k.watchers.LoadAndDelete(spec.PodSpec.Name); loaded {
-		if isPodDeleted {
-			watcher := w.(*podwatcher.PodWatcher)
-			if err := watcher.WaitPodDeleted(); err != nil && err != context.Canceled {
-				log.WithError(err).Error("PodWatcher terminated with error")
-			} else {
-				log.Trace("PodWatcher terminated")
-			}
-		}
-	}
-
-	return nil
 }
 
 // Run runs the pipeline step.
@@ -183,10 +148,19 @@ func (k *Kubernetes) Run(ctx context.Context, specv runtime.Spec, stepv runtime.
 		WithField("container", containerId).
 		WithField("step", stepName)
 
-	w, loaded := k.watchers.LoadOrStore(podId, &podwatcher.PodWatcher{})
+	c := spec.lifecycle()
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, errPodStopped
+	}
+	key := podNamespace + "/" + podId
+	w, loaded := k.watchers.LoadOrStore(key, &podwatcher.PodWatcher{})
 	watcher := w.(*podwatcher.PodWatcher)
 	if !loaded {
-		watcher.Start(context.Background(), &podwatcher.KubernetesWatcher{
+		watchCtx, cancel := context.WithCancel(c.ctx)
+		c.watcherCancel = cancel
+		watcher.Start(watchCtx, &podwatcher.KubernetesWatcher{
 			PodNamespace: podNamespace,
 			PodName:      podId,
 			KubeClient:   k.client,
@@ -196,6 +170,19 @@ func (k *Kubernetes) Run(ctx context.Context, specv runtime.Spec, stepv runtime.
 		log.Trace("PodWatcher started")
 	}
 
+	c.mu.Unlock()
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-c.stop:
+			cancel()
+		case <-runCtx.Done():
+		}
+	}()
+	ctx = runCtx
+
 	err = watcher.AddContainer(step.ID, step.Placeholder, step.Image)
 	if err != nil {
 		return
@@ -203,12 +190,18 @@ func (k *Kubernetes) Run(ctx context.Context, specv runtime.Spec, stepv runtime.
 
 	log.Debug("Engine: Starting step")
 
-	err = <-k.startContainer(ctx, spec, step)
+	select {
+	case err = <-k.startContainer(ctx, spec, step):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.stop:
+		return nil, errPodStopped
+	}
 	if err != nil {
 		return
 	}
 
-	chErrStart := make(chan error)
+	chErrStart := make(chan error, 1)
 	go func() {
 		chErrStart <- watcher.WaitContainerStart(containerId)
 	}()
@@ -218,7 +211,9 @@ func (k *Kubernetes) Run(ctx context.Context, specv runtime.Spec, stepv runtime.
 	case <-time.After(k.containerStartTimeout):
 		err = podwatcher.StartTimeoutContainerError{Container: containerId, Image: containerImage}
 		log.WithError(err).Error("Engine: Container start timeout")
-	case <-spec.stop:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.stop:
 		return nil, errPodStopped
 	}
 	if err != nil {
@@ -235,7 +230,7 @@ func (k *Kubernetes) Run(ctx context.Context, specv runtime.Spec, stepv runtime.
 		err  error
 	}
 
-	chErrStop := make(chan containerResult)
+	chErrStop := make(chan containerResult, 1)
 	go func() {
 		code, err := watcher.WaitContainerTerminated(containerId)
 		chErrStop <- containerResult{code: code, err: err}
@@ -253,7 +248,9 @@ func (k *Kubernetes) Run(ctx context.Context, specv runtime.Spec, stepv runtime.
 			Exited:    true,
 			OOMKilled: false,
 		}
-	case <-spec.stop:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.stop:
 		return nil, errPodStopped
 	}
 
@@ -263,7 +260,15 @@ func (k *Kubernetes) Run(ctx context.Context, specv runtime.Spec, stepv runtime.
 func (k *Kubernetes) fetchLogs(ctx context.Context, spec *Spec, step *Step, output io.Writer) error {
 	// HACK: this timeout delays fetching the logs to ensure there is enough time to stream the logs.
 	// it does not delay the build speed.
-	time.Sleep(k.containerTimeToWaitForLogs)
+	timer := time.NewTimer(k.containerTimeToWaitForLogs)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-spec.lifecycle().stop:
+		return errPodStopped
+	case <-timer.C:
+	}
 	opts := &v1.PodLogOptions{
 		Follow:    true,
 		Container: step.ID,
@@ -298,16 +303,25 @@ func (k *Kubernetes) startContainer(ctx context.Context, spec *Spec, step *Step)
 	containerName := step.ID
 	containerImage := step.Image
 
-	_l, loaded := k.launchers.LoadOrStore(podName, launcher.New(podName, podNamespace, k.client, &spec.podUpdateMutex))
+	c := spec.lifecycle()
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		result := make(chan error, 1)
+		result <- errPodStopped
+		return result
+	}
+	_l, loaded := k.launchers.LoadOrStore(podNamespace+"/"+podName, launcher.New(podName, podNamespace, k.client, &spec.podUpdateMutex))
 	l := _l.(*launcher.Launcher)
 	if !loaded {
-		l.Start(ctx)
+		l.Start(c.ctx)
 	}
+	c.mu.Unlock()
 
 	statusEnvs := make(map[string]string)
 	for _, env := range statusesWhiteList {
 		statusEnvs[env] = step.Envs[env]
 	}
 
-	return l.Launch(containerName, containerImage, statusEnvs)
+	return l.Launch(ctx, containerName, containerImage, statusEnvs)
 }
