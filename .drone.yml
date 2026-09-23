@@ -31,6 +31,12 @@ steps:
   - name: build
     image: golang:1.16
     commands:
+      - |
+        if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+          git fetch --tags --unshallow
+        else
+          git fetch --tags
+        fi
       - sh scripts/build.sh
   - name: publish
     image: plugins/docker
@@ -74,6 +80,12 @@ steps:
   - name: build
     image: golang:1.16
     commands:
+      - |
+        if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+          git fetch --tags --unshallow
+        else
+          git fetch --tags
+        fi
       - sh scripts/build.sh
   - name: publish_arm64
     image: plugins/docker

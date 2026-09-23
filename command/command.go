@@ -6,15 +6,14 @@ package command
 
 import (
 	"context"
+	"fmt"
 	"os"
 
 	"github.com/drone-runners/drone-runner-kube/command/daemon"
+	"github.com/drone-runners/drone-runner-kube/internal/version"
 
 	"gopkg.in/alecthomas/kingpin.v2"
 )
-
-// program version
-var version = "0.0.0"
 
 // empty context
 var nocontext = context.Background()
@@ -27,6 +26,7 @@ func Command() {
 	registerExec(app)
 	daemon.Register(app)
 
-	kingpin.Version(version)
+	app.UsageWriter(os.Stdout)
+	app.Version(fmt.Sprintf("%#v", version.Get()))
 	kingpin.MustParse(app.Parse(os.Args[1:]))
 }

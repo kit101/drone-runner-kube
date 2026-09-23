@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Fix `--version` and report the Git tag-derived version, full commit SHA,
+  working tree state and Go toolchain version. Embed source metadata in GitHub
+  Actions and Drone release builds.
+
 ## [v1.0.0-rc.3](https://github.com/drone-runners/drone-runner-kube/tree/v1.0.0-rc.3) (2022-03-15)
 
 [Full Changelog](https://github.com/drone-runners/drone-runner-kube/compare/v1.0.0-rc.2...v1.0.0-rc.3)

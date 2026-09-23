@@ -43,6 +43,36 @@ overwrite `latest`.
 docker pull kit101z/drone-runner-kube:latest
 ```
 
+## Runner version
+
+Use `--version` to inspect the binary without configuring or starting the runner:
+
+```sh
+drone-runner-kube --version
+docker run --rm kit101z/drone-runner-kube:latest --version
+kubectl -n <namespace> exec <runner-pod> -- /bin/drone-runner-kube --version
+```
+
+The output follows the Helm build-info format:
+
+```text
+version.BuildInfo{Version:"v1.0.0", GitCommit:"<full-commit-sha>", GitTreeState:"clean", GoVersion:"go1.16.15"}
+```
+
+GitHub Actions and Drone builds use `scripts/build.sh` to embed the source
+metadata. `Version` comes from `git describe --tags --match 'v[0-9]*' --abbrev=7`:
+an exact release tag is preserved, later commits include the distance and short
+SHA (for example `v1.0.0-2-gabcdef0`), and a checkout without a reachable release
+tag reports `devel`. `GitCommit` is the full HEAD SHA. `GitTreeState` is `dirty`
+when tracked files differ from HEAD; otherwise it is `clean`. `GoVersion` is
+the Go toolchain version compiled into the executable.
+
+For local release builds, run `sh scripts/build.sh` (Linux amd64, arm64 and arm),
+or select architectures with `sh scripts/build.sh amd64 arm64`. Fetch the full
+history and release tags before building from a shallow clone. A plain
+`go build` without metadata injection reports `Version:"devel"` and
+`GitCommit:"unknown"`, `GitTreeState:"unknown"`.
+
 ## Release procedure
 
 Run the changelog generator.
