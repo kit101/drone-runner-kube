@@ -255,6 +255,30 @@ func (k *Kubernetes) cleanResourceContext(ctx context.Context, task string, r cl
 	if err := ctx.Err(); err != nil {
 		return false, "", err
 	}
+	// A recorded UID identifies the exact Secret created by this task. Let the
+	// API server enforce it, so ordinary cleanup needs only create/delete RBAC.
+	// Unknown creates still need the read-and-verify path below to learn a UID.
+	if r.Kind == "secrets" && r.UID != "" && !r.Unknown {
+		if beforeDelete != nil {
+			if err := beforeDelete(r.UID); err != nil {
+				return false, r.UID, err
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return false, r.UID, err
+		}
+		deleteCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+		defer cancel()
+		err := k.client.CoreV1().Secrets(r.Namespace).Delete(deleteCtx, r.Name, metav1.DeleteOptions{
+			Preconditions: &metav1.Preconditions{UID: &r.UID},
+		})
+		if apierrors.IsNotFound(err) {
+			return true, r.UID, nil
+		}
+		// An accepted deletion may still be blocked by a finalizer. Retry DELETE
+		// until NotFound confirms removal; conflicts retain the tracked UID.
+		return false, r.UID, err
+	}
 	readCtx, cancel := context.WithTimeout(ctx, requestTimeout)
 	var obj metav1.Object
 	var err error
@@ -318,7 +342,7 @@ func (k *Kubernetes) cleanResourceContext(ctx context.Context, task string, r cl
 	case "namespaces":
 		err = k.client.CoreV1().Namespaces().Delete(deleteCtx, r.Name, opts)
 	}
-	// DELETE accepted is not proof of removal. Confirm with a fresh GET.
+	// DELETE accepted is not proof of removal. Confirm on a later cleanup pass.
 	if apierrors.IsNotFound(err) {
 		err = nil
 	}

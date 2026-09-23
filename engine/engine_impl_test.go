@@ -148,12 +148,154 @@ func TestDestroyAfterCreateConnectionLossAndDeleteTimeout(t *testing.T) {
 	if err := k.Destroy(context.Background(), s); err != nil {
 		t.Fatal(err)
 	}
-	if atomic.LoadInt32(&creates) != 1 || atomic.LoadInt32(&deletes) != 2 {
+	if atomic.LoadInt32(&creates) != 1 || atomic.LoadInt32(&deletes) != 3 {
 		t.Fatalf("unexpected request counts: create=%d delete=%d", creates, deletes)
 	}
 	if _, err := c.CoreV1().Secrets("test").Get(context.Background(), "task", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("Secret was not removed after delete recovery: %v", err)
 	}
+}
+
+func TestDestroyKnownSecretWithoutGetPermission(t *testing.T) {
+	c := cleanupClient()
+	var gets, deletes int32
+	c.PrependReactor("get", "secrets", func(ktesting.Action) (bool, runtime.Object, error) {
+		atomic.AddInt32(&gets, 1)
+		return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "secrets"}, "task", errors.New("get denied"))
+	})
+	c.PrependReactor("delete", "secrets", func(a ktesting.Action) (bool, runtime.Object, error) {
+		atomic.AddInt32(&deletes, 1)
+		return false, nil, nil
+	})
+	k := New(c, time.Second, 0)
+	s := &Spec{PodSpec: PodSpec{Name: "task", Namespace: "test"}}
+	if err := k.Setup(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	if err := k.Destroy(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	if atomic.LoadInt32(&gets) != 0 {
+		t.Fatalf("known Secret cleanup issued %d GET requests", gets)
+	}
+	if atomic.LoadInt32(&deletes) != 2 {
+		t.Fatalf("expected DELETE acceptance followed by NotFound confirmation, got %d requests", deletes)
+	}
+	if _, err := c.Tracker().Get(v1.SchemeGroupVersion.WithResource("secrets"), "test", "task"); !apierrors.IsNotFound(err) {
+		t.Fatalf("Secret was not removed: %v", err)
+	}
+}
+
+func TestKnownSecretDeleteOnlyStateMachine(t *testing.T) {
+	t.Run("uid conflict retains replacement", func(t *testing.T) {
+		c := cleanupClient()
+		_, err := c.CoreV1().Secrets("test").Create(context.Background(), &v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "task"}}, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		replacement, _ := c.CoreV1().Secrets("test").Get(context.Background(), "task", metav1.GetOptions{})
+		replacement.UID = "replacement"
+		if _, err := c.CoreV1().Secrets("test").Update(context.Background(), replacement, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		var gets int32
+		c.PrependReactor("get", "secrets", func(ktesting.Action) (bool, runtime.Object, error) {
+			atomic.AddInt32(&gets, 1)
+			return true, nil, errors.New("unexpected GET")
+		})
+		c.PrependReactor("delete", "secrets", func(a ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewConflict(schema.GroupResource{Resource: "secrets"}, "task", errors.New("UID precondition failed"))
+		})
+		k := New(c, time.Second, 0).(*Kubernetes)
+		done, uid, err := k.cleanResource("owner", cleanupResource{Kind: "secrets", Namespace: "test", Name: "task", UID: "uid-task"})
+		if done || !apierrors.IsConflict(err) || uid != "uid-task" {
+			t.Fatalf("replacement was incorrectly settled: done=%v uid=%q err=%v", done, uid, err)
+		}
+		if atomic.LoadInt32(&gets) != 0 {
+			t.Fatalf("known Secret cleanup issued %d GET requests", gets)
+		}
+		current, err := c.Tracker().Get(v1.SchemeGroupVersion.WithResource("secrets"), "test", "task")
+		if err != nil || current.(*v1.Secret).UID != "replacement" {
+			t.Fatalf("replacement Secret was changed: %v", err)
+		}
+	})
+
+	t.Run("accepted deletion remains pending", func(t *testing.T) {
+		c := cleanupClient()
+		_, err := c.CoreV1().Secrets("test").Create(context.Background(), &v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "task"}}, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.PrependReactor("delete", "secrets", func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, nil // accepted, but a finalizer-like condition retains the object
+		})
+		k := New(c, time.Second, 0).(*Kubernetes)
+		callbackCalls := 0
+		for i := 0; i < 2; i++ {
+			done, uid, err := k.cleanResourceContext(context.Background(), "owner", cleanupResource{Kind: "secrets", Namespace: "test", Name: "task", UID: "uid-task"}, func(got types.UID) error {
+				callbackCalls++
+				if got != "uid-task" {
+					t.Errorf("callback UID = %q", got)
+				}
+				return nil
+			})
+			if done || err != nil || uid != "uid-task" {
+				t.Fatalf("accepted deletion was incorrectly settled: done=%v uid=%q err=%v", done, uid, err)
+			}
+		}
+		if callbackCalls != 2 {
+			t.Fatalf("beforeDelete callback called %d times", callbackCalls)
+		}
+		if _, err := c.Tracker().Get(v1.SchemeGroupVersion.WithResource("secrets"), "test", "task"); err != nil {
+			t.Fatalf("pending Secret disappeared: %v", err)
+		}
+	})
+
+	t.Run("transient delete error can retry", func(t *testing.T) {
+		c := cleanupClient()
+		_, err := c.CoreV1().Secrets("test").Create(context.Background(), &v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "task"}}, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var deletes int32
+		c.PrependReactor("delete", "secrets", func(ktesting.Action) (bool, runtime.Object, error) {
+			if atomic.AddInt32(&deletes, 1) == 1 {
+				return true, nil, apierrors.NewServiceUnavailable("temporary failure")
+			}
+			return false, nil, nil
+		})
+		k := New(c, time.Second, 0).(*Kubernetes)
+		resource := cleanupResource{Kind: "secrets", Namespace: "test", Name: "task", UID: "uid-task"}
+		if done, _, err := k.cleanResource("owner", resource); done || !apierrors.IsServiceUnavailable(err) {
+			t.Fatalf("transient failure was not retained: done=%v err=%v", done, err)
+		}
+		if done, _, err := k.cleanResource("owner", resource); done || err != nil {
+			t.Fatalf("accepted retry was incorrectly settled: done=%v err=%v", done, err)
+		}
+		if done, _, err := k.cleanResource("owner", resource); !done || err != nil {
+			t.Fatalf("NotFound did not complete retry: done=%v err=%v", done, err)
+		}
+	})
+
+	t.Run("unknown create requires GET", func(t *testing.T) {
+		c := cleanupClient()
+		var deletes int32
+		c.PrependReactor("get", "secrets", func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "secrets"}, "task", errors.New("get denied"))
+		})
+		c.PrependReactor("delete", "secrets", func(ktesting.Action) (bool, runtime.Object, error) {
+			atomic.AddInt32(&deletes, 1)
+			return false, nil, nil
+		})
+		k := New(c, time.Second, 0).(*Kubernetes)
+		done, uid, err := k.cleanResource("owner", cleanupResource{Kind: "secrets", Namespace: "test", Name: "task", Unknown: true})
+		if done || !apierrors.IsForbidden(err) || uid != "" {
+			t.Fatalf("unknown create was incorrectly settled: done=%v uid=%q err=%v", done, uid, err)
+		}
+		if atomic.LoadInt32(&deletes) != 0 {
+			t.Fatal("unknown Secret was deleted without ownership verification")
+		}
+	})
 }
 
 func TestDestroyDoesNotDeleteUnownedResources(t *testing.T) {
@@ -310,7 +452,11 @@ func TestResourceRequestsUseSingleCreateAndUIDDelete(t *testing.T) {
 			if opts.Preconditions == nil || opts.Preconditions.UID == nil || *opts.Preconditions.UID != "original" {
 				t.Error("missing UID precondition")
 			}
-			if opts.GracePeriodSeconds == nil || *opts.GracePeriodSeconds != 30 {
+			if r.URL.Path == "/api/v1/namespaces/test/secrets/task" {
+				if opts.GracePeriodSeconds != nil {
+					t.Error("Secret deletion unexpectedly set a grace period")
+				}
+			} else if opts.GracePeriodSeconds == nil || *opts.GracePeriodSeconds != 30 {
 				t.Error("missing normal Pod grace period")
 			}
 			json.NewEncoder(w).Encode(metav1.Status{TypeMeta: metav1.TypeMeta{Kind: "Status", APIVersion: "v1"}, Status: "Success", Code: 200})
@@ -333,8 +479,12 @@ func TestResourceRequestsUseSingleCreateAndUIDDelete(t *testing.T) {
 		t.Fatal("ambiguous Create response lost its recovery record")
 	}
 	complete, uid, err := k.cleanResource("owner", cleanupResource{Kind: "pods", Namespace: "test", Name: "task", UID: "original"})
-	if err != nil || complete || uid != "original" || atomic.LoadInt32(&deletes) != 1 {
+	if err != nil || complete || uid != "original" {
 		t.Fatalf("unexpected delete result: %v %v %v", complete, uid, err)
+	}
+	complete, uid, err = k.cleanResource("owner", cleanupResource{Kind: "secrets", Namespace: "test", Name: "task", UID: "original"})
+	if err != nil || complete || uid != "original" || atomic.LoadInt32(&deletes) != 2 {
+		t.Fatalf("unexpected Secret delete result: %v %v %v", complete, uid, err)
 	}
 }
 

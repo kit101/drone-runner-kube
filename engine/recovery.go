@@ -128,7 +128,7 @@ func (r *recovery) checkAccess(ctx context.Context, namespace, group, resource, 
 func (r *recovery) checkTask(ctx context.Context, s *Spec) error {
 	for resource, verbs := range map[string][]string{
 		"pods":     {"get", "list", "watch", "create", "update", "delete"},
-		"pods/log": {"get"}, "secrets": {"get", "create", "delete"},
+		"pods/log": {"get"}, "secrets": {"create", "delete"},
 	} {
 		for _, verb := range verbs {
 			if err := r.checkAccess(ctx, s.PodSpec.Namespace, "", resource, verb); err != nil {

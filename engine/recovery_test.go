@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -496,5 +497,51 @@ func TestRecoveryRejectsUnavailableIdentityAndPermissions(t *testing.T) {
 	}
 	if err := r.checkTask(context.Background(), &Spec{PodSpec: PodSpec{Namespace: "denied"}}); err == nil {
 		t.Fatal("task namespace permissions not checked")
+	}
+}
+
+func TestRecoveryKnownSecretDoesNotRequireGetPermission(t *testing.T) {
+	k, r, c := recoveryFixture(t)
+	var secretGets int32
+	c.PrependReactor("create", "selfsubjectaccessreviews", func(a ktesting.Action) (bool, runtime.Object, error) {
+		review := a.(ktesting.CreateAction).GetObject().(*authorization.SelfSubjectAccessReview)
+		attrs := review.Spec.ResourceAttributes
+		allowed := true
+		if attrs != nil && attrs.Resource == "secrets" && attrs.Verb == "get" {
+			atomic.AddInt32(&secretGets, 1)
+			allowed = false
+		}
+		return true, &authorization.SelfSubjectAccessReview{Status: authorization.SubjectAccessReviewStatus{Allowed: allowed}}, nil
+	})
+	c.PrependReactor("get", "secrets", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "secrets"}, "task", errors.New("get denied"))
+	})
+	s := &Spec{PodSpec: PodSpec{Name: "task", Namespace: "test"}}
+	if err := k.Setup(context.Background(), s); err != nil {
+		t.Fatalf("Setup required Secret GET permission: %v", err)
+	}
+	if atomic.LoadInt32(&secretGets) != 0 {
+		t.Fatalf("permission preflight requested get secrets %d times", secretGets)
+	}
+	state := s.lifecycle()
+	state.mu.Lock()
+	state.closed = true
+	state.mu.Unlock()
+	if err := r.sync(state); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := r.reconcile(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := c.Tracker().Get(v1.SchemeGroupVersion.WithResource("secrets"), "test", "task"); !apierrors.IsNotFound(err) {
+		t.Fatalf("known Secret was not recovered without GET permission: %v", err)
+	}
+	_, record := readCleanupRecord(t, r, state.id)
+	for _, resource := range record.Resources {
+		if resource.Kind == "secrets" && !resource.Done {
+			t.Fatal("recovery record did not confirm Secret removal")
+		}
 	}
 }

@@ -2,6 +2,23 @@
 
 本功能只处理任务资源回收，不恢复流水线、不重放步骤，也不修改崩溃任务在 Drone Server 上的阶段状态。基础清理默认启用；跨进程补偿需要显式开启。仅管理本版记录的新任务，历史 Pod 不会被自动纳管。
 
+## Secret 权限兼容
+
+**正常创建成功的任务 Secret 只需 `create/delete` 权限，无需新增 `get secrets`。** runner 保存创建响应中的 UID，清理时直接发送带 UID 条件的 DELETE。删除成功响应仅代表请求被接受；后续 DELETE 返回 NotFound 才确认资源已消失。同名对象的 UID 不符时，API 会拒绝删除，runner 保留待处理状态。
+
+现有 Secret 规则可保持不变，基础清理和重启补偿的必要权限检查均不要求 Secret get/list/watch：
+
+```yaml
+# 现有角色中与任务 Secret 相关的规则
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create", "delete"]
+```
+
+边界是创建响应丢失，或者恢复记录尚未保存成功创建的 UID：此时仍需 GET 核验任务、创建尝试和 pool 标记后才能取得可信 UID。若已有 get 权限，沿用该恢复路径；若没有，则保留待处理状态并告警，需要运维核验处理，不会按名称无条件删除，也不会把 Forbidden 当作清理成功。此限制不影响 Pod 优先清理。
+
+升级镜像需重启 runner。若未开启持久恢复，旧进程中的待清理队列不会迁移，已遗留 Secret 需要另行核验处理；本功能不自动纳管没有恢复记录的历史资源。已有持久记录且保存了 Secret UID 时，新版可按原有回收条件继续处理。
+
 ## 开启条件与配置
 
 runner 必须在 Kubernetes Pod 内作为容器 PID 1 运行，使用 in-cluster 客户端。默认镜像的 ENTRYPOINT 满足 PID 1 要求；使用 shell 包装时应通过 exec 启动 runner。集群外的 exec 和自定义 kubeconfig 不启用重启补偿。
@@ -56,7 +73,7 @@ env:
 | runner 所在命名空间 | core/pods | get |
 | 每个任务命名空间 | core/pods | get, list, watch, create, update, delete |
 | 每个任务命名空间 | core/pods/log | get |
-| 每个任务命名空间 | core/secrets | get, create, delete |
+| 每个任务命名空间 | core/secrets | create, delete；get 可选，仅用于 UID 未知的创建恢复 |
 | 集群级，可用 resourceNames 限定管理命名空间 | core/namespaces | get |
 | 仅使用自动临时命名空间时 | core/namespaces | get, create, delete |
 | 权限自检 | authorization.k8s.io/selfsubjectaccessreviews | create |
@@ -67,7 +84,7 @@ env:
 
 - 每个任务一个 ConfigMap，名称为 drone-cleanup-加任务 UUID，带协议版本、pool 和任务标记；没有任务 Pod 的 ownerReference，因而不随任务资源一起消失。
 - 记录仅保存执行者身份、进程会话及开始时间、创建尝试、资源名称/UID、清理进度与错误类别，不保存完整 Spec、脚本、环境变量或 Secret 内容。
-- 每次资源 Create 前先保存发送意图。保存失败则不发送 Create；创建请求单次发送，不透明重发。未知结果即使连续查询为 NotFound 也会保留，发现匹配的晚到对象后才补齐 UID 并清理。
+- 每次资源 Create 前先保存发送意图。保存失败则不发送 Create；创建请求单次发送，不透明重发。未知结果即使连续查询为 NotFound 也会保留，取得读取权限并发现匹配的晚到对象后才补齐 UID 并清理。已保存 UID 的 Secret 直接按 UID 删除，无需重新读取标签或内容。
 - 补偿器每 5 秒扫描本 pool 的记录，用 Lease 协调扫描者。每次写记录使用 resourceVersion，每次删资源使用 UID，删除记录同时校验 UID 和 resourceVersion。丢失 Lease 后停止新动作，在途请求可能完成。
 - 任务明确交接清理，或者记录中的 Pod UID、容器 ID 与已终止运行实例匹配时，才允许回收。终止时间还必须不早于记录中的进程会话开始，防止启动时读到旧容器状态而误删新任务。
 - 同名 runner Pod 被替换、runner Pod 不存在、NotReady、记录太旧或不同进程不认识任务，都不足以证明执行者已终止。缺乏证据时保留记录并告警。极短会话或时钟异常导致时间事实无法确认时同样保留。
